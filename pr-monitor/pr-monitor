@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Monitor a GitHub PR's checks. Poll every 5min, desktop-notify on terminal state.
+# Usage:
+#   pr-monitor <PR_URL>
+#   pr-monitor <PR_NUMBER> [--repo owner/name]
+set -euo pipefail
+
+INTERVAL="${PR_MONITOR_INTERVAL:-300}"
+
+usage() {
+  echo "Usage: $0 <PR_URL|PR_NUMBER> [--repo owner/name]" >&2
+  exit 1
+}
+
+[[ $# -ge 1 ]] || usage
+
+INPUT="$1"; shift || true
+REPO=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo) REPO="$2"; shift 2;;
+    *) usage;;
+  esac
+done
+
+if [[ "$INPUT" =~ ^https?://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+  REPO="${BASH_REMATCH[1]}"
+  PR="${BASH_REMATCH[2]}"
+elif [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+  PR="$INPUT"
+  [[ -n "$REPO" ]] || { echo "PR number needs --repo owner/name" >&2; exit 1; }
+else
+  usage
+fi
+
+notify() {
+  local title="$1" body="$2" urgency="${3:-normal}"
+  notify-send -u "$urgency" -a "pr-monitor" "$title" "$body" || true
+  echo "[$(date +%H:%M:%S)] $title — $body"
+}
+
+PR_URL="https://github.com/$REPO/pull/$PR"
+notify "PR #$PR monitor started" "Polling every ${INTERVAL}s — $REPO" low
+
+while true; do
+  JSON="$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup,title 2>&1)" || {
+    notify "PR #$PR monitor error" "gh failed: $JSON" critical
+    sleep "$INTERVAL"; continue
+  }
+
+  read -r TOTAL PENDING FAIL PASS NEUTRAL < <(echo "$JSON" | jq -r '
+    .statusCheckRollup as $c
+    | [
+        ($c | length),
+        ($c | map(select(
+            ((.status // "") | IN("IN_PROGRESS","QUEUED","PENDING","WAITING"))
+            or ((.state // "") | IN("PENDING","EXPECTED"))
+          )) | length),
+        ($c | map(select(
+            ((.conclusion // "") | IN("FAILURE","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"))
+            or ((.state // "") | IN("FAILURE","ERROR"))
+          )) | length),
+        ($c | map(select(
+            ((.conclusion // "") == "SUCCESS")
+            or ((.state // "") == "SUCCESS")
+          )) | length),
+        ($c | map(select(
+            ((.conclusion // "") | IN("SKIPPED","CANCELLED","NEUTRAL"))
+          )) | length)
+      ] | @tsv')
+
+  echo "[$(date +%H:%M:%S)] total=$TOTAL pending=$PENDING pass=$PASS fail=$FAIL neutral=$NEUTRAL"
+
+  if [[ "$PENDING" == "0" && "$TOTAL" != "0" ]]; then
+    TITLE="$(echo "$JSON" | jq -r '.title')"
+    if [[ "$FAIL" != "0" ]]; then
+      FAILED_NAMES="$(echo "$JSON" | jq -r '.statusCheckRollup
+        | map(select(
+            ((.conclusion // "") | IN("FAILURE","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"))
+            or ((.state // "") | IN("FAILURE","ERROR"))
+          ))
+        | map(.name // .context) | join(", ")')"
+      notify "❌ PR #$PR FAILED" "$TITLE
+$FAIL failed: $FAILED_NAMES
+$PR_URL" critical
+    else
+      notify "✅ PR #$PR PASSED" "$TITLE
+$PASS passed, $NEUTRAL skipped/neutral
+$PR_URL" normal
+    fi
+    echo
+    echo "Open in browser:"
+    echo "  gh pr view $PR --repo $REPO --web"
+    if [[ "$FAIL" == "0" ]]; then
+      echo "Approve:"
+      echo "  gh pr review $PR --repo $REPO --approve"
+    fi
+    exit 0
+  fi
+
+  sleep "$INTERVAL"
+done
